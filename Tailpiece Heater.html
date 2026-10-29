@@ -1,0 +1,449 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ========== LCD I2C 16x2 ==========
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ========== PIN DEFINISI ==========
+#define ONE_WIRE_BUS 2
+#define RELAY_PIN 3
+#define LED_HIJAU 4
+#define LED_KUNING 5
+#define LED_MERAH 6
+#define BUZZER_PIN 7
+
+// ========== KONFIGURASI PID ==========
+const float TARGET = 75.0;           // Target suhu (°C)
+const float HYSTERESIS = 0.5;        // Histeresis ±0.5°C
+
+// Parameter PID (tuning untuk sistem lambat dengan overshoot)
+float Kp = 2.5;    // Gain Proporsional - respon terhadap error
+float Ki = 0.3;    // Gain Integral   - menghilangkan error steady-state
+float Kd = 1.8;    // Gain Derivatif  - meredam overshoot
+
+// Variabel PID
+float error = 0;
+float lastError = 0;
+float integral = 0;
+float derivative = 0;
+float pidOutput = 0;
+
+// Batasan PID
+const float INTEGRAL_LIMIT = 20.0;   // Anti-windup
+const float OUTPUT_MIN = -100;        // Output minimum
+const float OUTPUT_MAX = 100;         // Output maksimum
+
+// ========== KONFIGURASI SISTEM ==========
+const float OVERHEAT = 85.0;           // Batas overheat
+const unsigned long PID_INTERVAL = 500;  // Hitung PID setiap 500ms
+const unsigned long CYCLE_TIME = 2000;   // Siklus PWM 2 detik
+
+// ========== VARIABEL GLOBAL ==========
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+float suhu = 0;
+float suhuSebelumnya = 0;
+float trend = 0;
+
+bool heaterActive = false;
+bool stabilisasi = false;
+bool errorOverheat = false;
+
+unsigned long lastPIDtime = 0;
+unsigned long lastCycleTime = 0;
+unsigned long lastLcdUpdate = 0;
+unsigned long lastBuzzerToggle = 0;
+
+// Statistik
+float suhuMax = 0;
+float suhuMin = 100;
+unsigned long startTime = 0;
+
+// ========== FUNGSI DASAR ==========
+void heaterOn() {
+  if (!heaterActive) {
+    digitalWrite(RELAY_PIN, LOW);    // Relay aktif LOW
+    digitalWrite(LED_KUNING, HIGH);
+    heaterActive = true;
+    Serial.println("🔥 HEATER ON");
+  }
+}
+
+void heaterOff() {
+  if (heaterActive) {
+    digitalWrite(RELAY_PIN, HIGH);   // Relay mati
+    digitalWrite(LED_KUNING, LOW);
+    heaterActive = false;
+    Serial.println("❄️ HEATER OFF");
+  }
+}
+
+// ========== FUNGSI PID ==========
+void resetPID() {
+  error = 0;
+  lastError = 0;
+  integral = 0;
+  derivative = 0;
+  pidOutput = 0;
+  Serial.println("PID Reset");
+}
+
+float computePID(float currentTemp, float targetTemp) {
+  unsigned long now = millis();
+  float deltaTime = (now - lastPIDtime) / 1000.0;
+  
+  if (deltaTime <= 0) deltaTime = 0.1;
+  lastPIDtime = now;
+  
+  // Hitung error (error = target - suhu)
+  error = targetTemp - currentTemp;
+  
+  // Hitung Integral dengan anti-windup
+  integral += error * deltaTime;
+  integral = constrain(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+  
+  // Hitung Derivatif (menggunakan perubahan error)
+  derivative = (error - lastError) / deltaTime;
+  
+  // Hitung PID Output
+  pidOutput = (Kp * error) + (Ki * integral) + (Kd * derivative);
+  
+  // Batasi output
+  pidOutput = constrain(pidOutput, OUTPUT_MIN, OUTPUT_MAX);
+  
+  // Simpan error untuk iterasi berikutnya
+  lastError = error;
+  
+  // Tampilkan debug PID (setiap 2 detik)
+  static unsigned long lastDebug = 0;
+  if (millis() - lastDebug >= 2000) {
+    lastDebug = millis();
+    Serial.print("  PID: P=");
+    Serial.print(Kp * error, 1);
+    Serial.print(" I=");
+    Serial.print(Ki * integral, 1);
+    Serial.print(" D=");
+    Serial.print(Kd * derivative, 1);
+    Serial.print(" | Output=");
+    Serial.println(pidOutput, 1);
+  }
+  
+  return pidOutput;
+}
+
+// ========== FUNGSI KONTROL RELAY BERDASARKAN PID ==========
+void controlRelayWithPID(float pidValue, float currentTemp) {
+  // Konversi PID output (-100..100) ke duty cycle (0..100%)
+  int dutyCycle = constrain(map(pidValue, -100, 100, 0, 100), 0, 100);
+  
+  // Override untuk kondisi ekstrim
+  if (currentTemp >= OVERHEAT) {
+    heaterOff();
+    return;
+  }
+  
+  if (currentTemp <= TARGET - 5) {
+    // Suhu terlalu dingin -> nyalakan terus
+    heaterOn();
+    return;
+  }
+  
+  if (currentTemp >= TARGET + 3) {
+    // Suhu terlalu panas -> matikan
+    heaterOff();
+    return;
+  }
+  
+  // Logika zona mati (deadband) untuk mengurangi switching
+  if (abs(error) < HYSTERESIS) {
+    // Dalam zona nyaman, pertahankan status
+    return;
+  }
+  
+  // Gunakan duty cycle dari PID
+  unsigned long now = millis();
+  unsigned long cyclePos = (now - lastCycleTime) % CYCLE_TIME;
+  
+  if (cyclePos < (dutyCycle * CYCLE_TIME / 100)) {
+    if (!heaterActive) heaterOn();
+  } else {
+    if (heaterActive) heaterOff();
+  }
+}
+
+// ========== FUNGSI DETEKSI TREN SUHU ==========
+float hitungTrend() {
+  float trend = suhu - suhuSebelumnya;
+  suhuSebelumnya = suhu;
+  return trend;
+}
+
+// ========== FUNGSI LCD ==========
+void updateLCD() {
+  // Baris 1: Suhu dan Target
+  lcd.setCursor(0, 0);
+  lcd.print("T:");
+  lcd.print(suhu, 1);
+  lcd.print("C ");
+  lcd.print("Set:");
+  lcd.print(TARGET, 0);
+  lcd.print("C  ");
+  
+  // Tampilkan PID Output (singkat)
+  lcd.setCursor(12, 0);
+  if (pidOutput > 0) {
+    lcd.print("+");
+    lcd.print((int)pidOutput);
+  } else {
+    lcd.print((int)pidOutput);
+  }
+  lcd.print("% ");
+  
+  // Baris 2: Status dan Heater
+  lcd.setCursor(0, 1);
+  if (!stabilisasi) {
+    lcd.print("WARMUP   ");
+  } else if (errorOverheat) {
+    lcd.print("OVERHEAT! ");
+  } else if (abs(error) < HYSTERESIS) {
+    lcd.print("STABIL   ");
+  } else if (error > 0) {
+    lcd.print("HEATING  ");
+  } else {
+    lcd.print("COOLING  ");
+  }
+  
+  // Indikator Heater
+  lcd.setCursor(10, 1);
+  if (heaterActive) {
+    lcd.print("[ON] ");
+  } else {
+    lcd.print("[OFF]");
+  }
+  
+  // Indikator LED di LCD
+  lcd.setCursor(15, 1);
+  if (heaterActive) {
+    lcd.print("H");
+  } else {
+    lcd.print(" ");
+  }
+}
+
+// ========== TAMPILAN INTRO ==========
+void tampilIntro() {
+  lcd.init();
+  lcd.backlight();
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Sistem Heater");
+  lcd.setCursor(0, 1);
+  lcd.print("PID Control");
+  delay(2000);
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Target: 75.0 C");
+  lcd.setCursor(0, 1);
+  lcd.print("Tuning PID...");
+  delay(2000);
+  
+  lcd.clear();
+  Serial.println("========================================");
+  Serial.println("     SISTEM HEATER PID CONTROL");
+  Serial.println("========================================");
+  Serial.print("Target Suhu: ");
+  Serial.print(TARGET);
+  Serial.println(" C");
+  Serial.print("PID Parameters: Kp=");
+  Serial.print(Kp);
+  Serial.print(", Ki=");
+  Serial.print(Ki);
+  Serial.print(", Kd=");
+  Serial.println(Kd);
+  Serial.println("========================================");
+}
+
+// ========== TAMPILAN STATISTIK ==========
+void tampilStatistik() {
+  Serial.println("========== STATISTIK ==========");
+  Serial.print("Suhu Maksimum: ");
+  Serial.println(suhuMax, 1);
+  Serial.print("Suhu Minimum: ");
+  Serial.println(suhuMin, 1);
+  Serial.print("Rata-rata: ");
+  Serial.println((suhuMax + suhuMin) / 2, 1);
+  Serial.print("Lama running: ");
+  Serial.print((millis() - startTime) / 60000);
+  Serial.println(" menit");
+  Serial.println("=================================");
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  
+  // Inisialisasi LCD
+  tampilIntro();
+  
+  // Inisialisasi pin
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LED_HIJAU, OUTPUT);
+  pinMode(LED_KUNING, OUTPUT);
+  pinMode(LED_MERAH, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  
+  // Status awal
+  heaterOff();
+  digitalWrite(LED_HIJAU, HIGH);
+  digitalWrite(LED_MERAH, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  // Inisialisasi sensor
+  sensors.begin();
+  
+  // Reset variabel
+  startTime = millis();
+  resetPID();
+  
+  // Mulai pemanasan
+  heaterOn();
+  
+  Serial.println("Sistem siap! Memanaskan...");
+}
+
+// ========== LOOP UTAMA ==========
+void loop() {
+  // Baca suhu setiap loop
+  sensors.requestTemperatures();
+  suhu = sensors.getTempCByIndex(0);
+  
+  // Update statistik
+  if (suhu > suhuMax) suhuMax = suhu;
+  if (suhu < suhuMin) suhuMin = suhu;
+  
+  // Hitung trend suhu
+  trend = hitungTrend();
+  
+  // ===== 1. PROTEKSI OVERHEAT =====
+  if (suhu >= OVERHEAT) {
+    heaterOff();
+    digitalWrite(LED_MERAH, HIGH);
+    errorOverheat = true;
+    
+    // Buzzer bip-bip
+    if (millis() - lastBuzzerToggle > 300) {
+      lastBuzzerToggle = millis();
+      digitalWrite(BUZZER_PIN, !digitalRead(BUZZER_PIN));
+    }
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("!!! OVERHEAT !!!");
+    lcd.setCursor(0, 1);
+    lcd.print("Suhu: ");
+    lcd.print(suhu, 1);
+    lcd.print("C STOP!");
+    
+    Serial.println("⚠️ OVERHEAT! SISTEM STOP ⚠️");
+    delay(1000);
+    return;
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+  
+  // ===== 2. MODE PEMANASAN AWAL =====
+  if (!stabilisasi) {
+    if (suhu < TARGET) {
+      if (!heaterActive) heaterOn();
+      
+      // Tampilkan status di LCD setiap detik
+      static unsigned long lastWarmupDisplay = 0;
+      if (millis() - lastWarmupDisplay >= 1000) {
+        lastWarmupDisplay = millis();
+        lcd.setCursor(0, 0);
+        lcd.print("WARMUP: ");
+        lcd.print(suhu, 1);
+        lcd.print("C/");
+        lcd.print(TARGET, 0);
+        lcd.print("C ");
+        lcd.setCursor(0, 1);
+        lcd.print("Heater ON     ");
+      }
+    } else {
+      // Mencapai target, mulai mode stabilisasi
+      heaterOff();
+      stabilisasi = true;
+      resetPID();
+      lastPIDtime = millis();
+      lastCycleTime = millis();
+      
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Target tercapai!");
+      lcd.setCursor(0, 1);
+      lcd.print("Mode STABIL");
+      delay(2000);
+      lcd.clear();
+      
+      Serial.println(">>> SUDAH MENCAPAI TARGET! MODE STABILISASI DIMULAI <<<");
+    }
+    
+    delay(100);
+    return;
+  }
+  
+  // ===== 3. MODE STABILISASI DENGAN PID =====
+  
+  // Hitung PID setiap interval
+  if (millis() - lastPIDtime >= PID_INTERVAL) {
+    computePID(suhu, TARGET);
+  }
+  
+  // Kontrol relay berdasarkan PID
+  controlRelayWithPID(pidOutput, suhu);
+  
+  // Update LCD setiap 300ms
+  if (millis() - lastLcdUpdate >= 300) {
+    lastLcdUpdate = millis();
+    updateLCD();
+  }
+  
+  // ===== 4. LED MERAH (Indikator) =====
+  if (abs(suhu - TARGET) > 2.0) {
+    digitalWrite(LED_MERAH, HIGH);
+  } else {
+    digitalWrite(LED_MERAH, LOW);
+  }
+  
+  // ===== 5. TAMPILKAN DATA KE SERIAL =====
+  static unsigned long lastSerialPrint = 0;
+  if (millis() - lastSerialPrint >= 1000) {
+    lastSerialPrint = millis();
+    
+    Serial.print("T:");
+    Serial.print(suhu, 1);
+    Serial.print("C | Err:");
+    Serial.print(error, 1);
+    Serial.print(" | PID:");
+    Serial.print(pidOutput, 0);
+    Serial.print("% | Heater:");
+    Serial.print(heaterActive ? "ON" : "OFF");
+    Serial.print(" | Trend:");
+    Serial.print(trend, 2);
+    Serial.println();
+  }
+  
+  // ===== 6. TAMPILKAN STATISTIK SETIAP 5 MENIT =====
+  static unsigned long lastStat = 0;
+  if (millis() - lastStat >= 300000) {  // 5 menit
+    lastStat = millis();
+    tampilStatistik();
+  }
+  
+  delay(50);  // Delay kecil untuk stabilitas
+}
